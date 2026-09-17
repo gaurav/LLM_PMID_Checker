@@ -24,3 +24,9 @@ src/__pycache__/
 
 # skip all content in the openapi directory
 /src/arax_nn/openapi_server/*
+
+# skip the downloaded release results
+/results/*
+
+# skip local environment files
+.env
