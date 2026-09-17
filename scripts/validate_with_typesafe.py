@@ -39,7 +39,17 @@ RETRYABLE_STATUS = {429, 500, 502, 503, 504, 529}
 
 # Bump whenever the wording, criteria or state shape below change: it is part of the resume
 # key, so without a bump a rerun would silently mix answers from two different prompts.
-PROMPT_VERSION = 1
+#   v1: full and lean state shapes, two questions (question- and statement-phrased).
+#   v2: one state shape (identifiers kept -- they disambiguate bare gene symbols), the
+#       statement phrasing only (the two phrasings agreed to within 0.020 over 93 documents),
+#       and criteria tightened against reading co-occurrence as support.
+PROMPT_VERSION = 2
+
+# Probabilities in this band are reported as "maybe" rather than yes/no. Judgment call, not a
+# fitted value: jev's probability does NOT reconstruct this repo's own maybe class (those 7
+# documents scored anywhere from 0.16 to 0.92), so this is an abstain zone, nothing more.
+# Applied when the CSV is written, so widening it costs a rewrite, not new API calls.
+MAYBE_BAND = (0.4, 0.6)
 
 # Everything from "predicted" onward in the sample files is this repo's own LLM output and
 # must never reach the API -- that is the answer we are asking for.
@@ -52,34 +62,29 @@ HELD_OUT_FIELDS = (
     "reasoning",
 )
 
-STATE_FIELDS = {
-    "full": (
-        "subject_curie",
-        "subject_name",
-        "predicate",
-        "object_curie",
-        "object_name",
-        "PMID",
-        "SemMedDB_sentences",
-    ),
-    "lean": ("subject_name", "predicate", "object_name", "SemMedDB_sentences"),
-}
+STATE_FIELDS = (
+    "subject_curie",
+    "subject_name",
+    "predicate",
+    "object_curie",
+    "object_name",
+    "PMID",
+    "SemMedDB_sentences",
+)
 
+# The "false" criterion names the co-occurrence failure explicitly: over 93 documents the
+# errors ran 9 false positives to 4 false negatives, every one of them a sentence that
+# mentioned both entities without asserting anything between them.
 CRITERIA = {
     "true": "The sentences state, or directly imply, the asserted relationship between the subject and object",
-    "false": "The sentences do not state the relationship, or state the opposite",
+    "false": (
+        "The sentences do not state the relationship, or state the opposite. Mentioning both "
+        "the subject and the object is not enough: the sentences must assert the relationship "
+        "between them, not merely discuss them together or describe a different relationship"
+    ),
 }
 
 QUESTIONS = {
-    "q_question": {
-        "type": "noul",
-        "instructions": (
-            "Do the sentences in 'SemMedDB_sentences', drawn from scientific publications, "
-            "support the assertion encoded by the triple 'subject_name' / 'predicate' "
-            "(a Biolink Model predicate) / 'object_name'?"
-        ),
-        "criteria": CRITERIA,
-    },
     "q_statement": {
         "type": "noul",
         "instructions": (
@@ -107,9 +112,10 @@ CSV_COLUMNS = (
     "object_name",
     "PMID",
     "repo_support",
-    "variant",
-    "q_question",
+    "jev_support",
     "q_statement",
+    "variant",
+    "prompt_version",
     "elapsed_s",
     "error",
 )
@@ -140,15 +146,24 @@ def get_api_key() -> str:
     return key
 
 
-def variant_label(shape: str, extra_fields: list[str]) -> str:
+def variant_label(extra_fields: list[str]) -> str:
     """Label that goes in the resume key, so extra fields can't collide with earlier runs."""
-    return "+".join([shape] + extra_fields)
+    return "+".join(["base"] + extra_fields)
 
 
-def build_payload(doc: dict, shape: str, extra_fields: list[str]) -> dict:
-    fields = STATE_FIELDS[shape] + tuple(extra_fields)
+def build_payload(doc: dict, extra_fields: list[str]) -> dict:
+    fields = STATE_FIELDS + tuple(extra_fields)
     state = {f: doc[f] for f in fields if f in doc}
     return {"state": state, "model": MODEL, "questions": QUESTIONS}
+
+
+def classify(probability, band: tuple[float, float]) -> str:
+    """yes / maybe / no, the same three classes this repo's own pipeline reports."""
+    if probability is None or probability == "":
+        return ""
+    if band[0] <= probability <= band[1]:
+        return "maybe"
+    return "yes" if probability > band[1] else "no"
 
 
 def post_json(payload: dict, api_key: str) -> dict:
@@ -200,7 +215,7 @@ def parse_noul(response: dict, key: str) -> float:
     return value
 
 
-def write_csv(jsonl_path: Path, csv_path: Path) -> int:
+def write_csv(jsonl_path: Path, csv_path: Path, band: tuple[float, float]) -> int:
     """Rewrite the CSV view from the whole JSONL. Cheap, so just redo it after every run."""
     rows = []
     for line in jsonl_path.read_text().splitlines():
@@ -210,7 +225,10 @@ def write_csv(jsonl_path: Path, csv_path: Path) -> int:
             record = json.loads(line)
         except json.JSONDecodeError:
             continue
-        rows.append({c: record.get(c, "") for c in CSV_COLUMNS})
+        row = {c: record.get(c, "") for c in CSV_COLUMNS}
+        # Derived here, not stored: rebanding is then a CSV rewrite, never a new API call.
+        row["jev_support"] = classify(record.get("q_statement"), band)
+        rows.append(row)
     with csv_path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         writer.writeheader()
@@ -247,25 +265,29 @@ def self_check() -> int:
 
     # Check the state's keys, not the serialized payload: the questions legitimately contain
     # the word "support", so a substring match over the whole payload cries wolf.
-    for shape in ("full", "lean"):
-        state = build_payload(doc, shape, [])["state"]
-        leaked = sorted(set(state) & set(HELD_OUT_FIELDS))
-        assert not leaked, f"{shape} state leaks this repo's own output: {leaked}"
-        assert set(state) <= set(doc), f"{shape} state invented fields"
+    state = build_payload(doc, [])["state"]
+    leaked = sorted(set(state) & set(HELD_OUT_FIELDS))
+    assert not leaked, f"state leaks this repo's own output: {leaked}"
+    assert set(state) <= set(doc), "state invented fields"
+    assert len(state) == 7
 
-    assert len(build_payload(doc, "lean", [])["state"]) == 4
-    assert len(build_payload(doc, "full", [])["state"]) == 7
-    assert "supporting_sentences" in build_payload(doc, "lean", ["supporting_sentences"])["state"]
-    assert variant_label("lean", ["supporting_sentences"]) == "lean+supporting_sentences"
+    assert "supporting_sentences" in build_payload(doc, ["supporting_sentences"])["state"]
+    assert variant_label(["supporting_sentences"]) == "base+supporting_sentences"
 
-    assert parse_noul({"answers": {"q_question": {"noul": 0.9}}}, "q_question") == 0.9
-    for bad in ({"answers": {}}, {"answers": {"q_question": {}}}, {}):
+    assert parse_noul({"answers": {"q_statement": {"noul": 0.9}}}, "q_statement") == 0.9
+    for bad in ({"answers": {}}, {"answers": {"q_statement": {}}}, {}):
         try:
-            parse_noul(bad, "q_question")
+            parse_noul(bad, "q_statement")
         except ValueError:
             pass
         else:
             raise AssertionError(f"should have rejected {bad}")
+
+    # Band edges are inclusive on both sides, so neither 0.4 nor 0.6 may read as a verdict.
+    assert [classify(p, (0.4, 0.6)) for p in (0.0, 0.39, 0.4, 0.5, 0.6, 0.61, 1.0)] == [
+        "no", "no", "maybe", "maybe", "maybe", "yes", "yes"
+    ]
+    assert classify(None, (0.4, 0.6)) == ""
 
     print("self-check passed")
     return 0
@@ -277,8 +299,12 @@ def main() -> int:
     parser.add_argument("--output", default="data/typesafe_jev_results.jsonl")
     parser.add_argument("--csv", help="CSV view of the results (default: --output with .csv)")
     parser.add_argument("--limit", type=int, help="Only process the first N documents")
-    parser.add_argument("--variants", default="full,lean")
     parser.add_argument("--extra-fields", default="", help="Comma-separated extra state fields")
+    parser.add_argument(
+        "--maybe-band",
+        default=",".join(str(b) for b in MAYBE_BAND),
+        help="lo,hi probability band reported as 'maybe' (applied when writing the CSV)",
+    )
     parser.add_argument("--delay", type=float, default=0.5, help="Seconds between calls")
     parser.add_argument("--dry-run", action="store_true", help="Print payloads, send nothing")
     parser.add_argument("--self-check", action="store_true", help="Offline assertions only")
@@ -300,14 +326,15 @@ def main() -> int:
     docs = json.loads(input_path.read_text())
     if args.limit:
         docs = docs[: args.limit]
-    shapes = [s.strip() for s in args.variants.split(",") if s.strip()]
     extra_fields = [f.strip() for f in args.extra_fields.split(",") if f.strip()]
+    band = tuple(float(b) for b in args.maybe_band.split(","))
+    if len(band) != 2 or not 0 <= band[0] <= band[1] <= 1:
+        sys.exit(f"--maybe-band must be lo,hi within 0..1, got {args.maybe_band}")
 
     if args.dry_run:
         for doc in docs:
-            for shape in shapes:
-                print(json.dumps(build_payload(doc, shape, extra_fields), indent=2))
-        logger.info("Dry run: %d payload(s), nothing sent", len(docs) * len(shapes))
+            print(json.dumps(build_payload(doc, extra_fields), indent=2))
+        logger.info("Dry run: %d payload(s), nothing sent", len(docs))
         return 0
 
     api_key = get_api_key()
@@ -321,63 +348,62 @@ def main() -> int:
     try:
         with output_path.open("a") as out:
             for doc in docs:
-                for shape in shapes:
-                    label = variant_label(shape, extra_fields)
-                    key = tuple(doc[f] for f in KEY_FIELDS) + (label, PROMPT_VERSION)
-                    if key in done:
-                        logger.debug("Already done: %s", key)
-                        continue
+                label = variant_label(extra_fields)
+                key = tuple(doc[f] for f in KEY_FIELDS) + (label, PROMPT_VERSION)
+                if key in done:
+                    logger.debug("Already done: %s", key)
+                    continue
 
-                    record = {f: doc[f] for f in KEY_FIELDS}
-                    record.update({f: doc.get(f) for f in NAME_FIELDS})
-                    record.update(
-                        variant=label,
-                        prompt_version=PROMPT_VERSION,
-                        repo_support=doc.get("support"),
-                        repo_predicted=doc.get("predicted"),
-                        ts=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                record = {f: doc[f] for f in KEY_FIELDS}
+                record.update({f: doc.get(f) for f in NAME_FIELDS})
+                record.update(
+                    variant=label,
+                    prompt_version=PROMPT_VERSION,
+                    repo_support=doc.get("support"),
+                    repo_predicted=doc.get("predicted"),
+                    ts=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                )
+
+                # Round trip only: request out, response back, including any retry waits.
+                # Excludes reading the sample, writing results and the inter-call delay.
+                query_started = time.monotonic()
+                response = post_json(build_payload(doc, extra_fields), api_key)
+                record["elapsed_s"] = round(time.monotonic() - query_started, 3)
+                calls += 1
+                logger.debug("Raw response: %s", json.dumps(response))
+                usage = response.get("usage") or {}
+                input_tokens += usage.get("input_tokens", 0)
+                output_tokens += usage.get("output_tokens", 0)
+
+                try:
+                    record["q_statement"] = parse_noul(response, "q_statement")
+                except ValueError as e:
+                    failures += 1
+                    record["error"] = str(e)
+                    logger.error("%s [%s]: %s", doc["PMID"], label, e)
+
+                record["model"] = response.get("model")
+                record["input_tokens"] = usage.get("input_tokens")
+                record["output_tokens"] = usage.get("output_tokens")
+
+                out.write(json.dumps(record) + "\n")
+                out.flush()
+
+                if "error" not in record:
+                    logger.info(
+                        "%s %.3f -> %-5s in %.2fs (repo said %s)",
+                        doc["PMID"], record["q_statement"],
+                        classify(record["q_statement"], band), record["elapsed_s"],
+                        record["repo_support"],
                     )
-
-                    # Round trip only: request out, response back, including any retry waits.
-                    # Excludes reading the sample, writing results and the inter-call delay.
-                    query_started = time.monotonic()
-                    response = post_json(build_payload(doc, shape, extra_fields), api_key)
-                    record["elapsed_s"] = round(time.monotonic() - query_started, 3)
-                    calls += 1
-                    logger.debug("Raw response: %s", json.dumps(response))
-                    usage = response.get("usage") or {}
-                    input_tokens += usage.get("input_tokens", 0)
-                    output_tokens += usage.get("output_tokens", 0)
-
-                    try:
-                        record["q_question"] = parse_noul(response, "q_question")
-                        record["q_statement"] = parse_noul(response, "q_statement")
-                    except ValueError as e:
-                        failures += 1
-                        record["error"] = str(e)
-                        logger.error("%s [%s]: %s", doc["PMID"], label, e)
-
-                    record["model"] = response.get("model")
-                    record["input_tokens"] = usage.get("input_tokens")
-                    record["output_tokens"] = usage.get("output_tokens")
-
-                    out.write(json.dumps(record) + "\n")
-                    out.flush()
-
-                    if "error" not in record:
-                        logger.info(
-                            "%s [%s] question=%.3f statement=%.3f in %.2fs (repo said %s)",
-                            doc["PMID"], label, record["q_question"], record["q_statement"],
-                            record["elapsed_s"], record["repo_support"],
-                        )
-                    time.sleep(args.delay)
+                time.sleep(args.delay)
     except KeyboardInterrupt:
         logger.warning("Interrupted -- everything completed so far is saved")
 
     csv_path = Path(args.csv) if args.csv else output_path.with_suffix(".csv")
     if not csv_path.is_absolute():
         csv_path = project_root / csv_path
-    csv_rows = write_csv(output_path, csv_path) if output_path.exists() else 0
+    csv_rows = write_csv(output_path, csv_path, band) if output_path.exists() else 0
 
     logger.info("=" * 70)
     logger.info("SUMMARY")
