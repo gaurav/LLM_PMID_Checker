@@ -20,6 +20,7 @@ Requires TYPESAFE_API_KEY in the environment or in .env.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import os
@@ -91,6 +92,27 @@ QUESTIONS = {
 }
 
 KEY_FIELDS = ("subject_curie", "predicate", "object_curie", "PMID")
+
+# Readable fields copied onto each record so the CSV view needs no lookup back to the sample.
+NAME_FIELDS = ("subject_name", "object_name")
+
+# The CSV is a view over the JSONL: what the other LLM decided, what jev decided, how long it
+# took. The JSONL keeps the variant, so any slice (lean only, full only, ...) can be re-derived
+# later without re-calling the API.
+CSV_COLUMNS = (
+    "subject_curie",
+    "subject_name",
+    "predicate",
+    "object_curie",
+    "object_name",
+    "PMID",
+    "repo_support",
+    "variant",
+    "q_question",
+    "q_statement",
+    "elapsed_s",
+    "error",
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -178,6 +200,24 @@ def parse_noul(response: dict, key: str) -> float:
     return value
 
 
+def write_csv(jsonl_path: Path, csv_path: Path) -> int:
+    """Rewrite the CSV view from the whole JSONL. Cheap, so just redo it after every run."""
+    rows = []
+    for line in jsonl_path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        rows.append({c: record.get(c, "") for c in CSV_COLUMNS})
+    with csv_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+    return len(rows)
+
+
 def load_done(output_path: Path) -> set:
     """Resume keys already in the output file, tolerating a torn final line."""
     done = set()
@@ -235,6 +275,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     parser.add_argument("--input", default="data/sample_100_triples.json")
     parser.add_argument("--output", default="data/typesafe_jev_results.jsonl")
+    parser.add_argument("--csv", help="CSV view of the results (default: --output with .csv)")
     parser.add_argument("--limit", type=int, help="Only process the first N documents")
     parser.add_argument("--variants", default="full,lean")
     parser.add_argument("--extra-fields", default="", help="Comma-separated extra state fields")
@@ -288,6 +329,7 @@ def main() -> int:
                         continue
 
                     record = {f: doc[f] for f in KEY_FIELDS}
+                    record.update({f: doc.get(f) for f in NAME_FIELDS})
                     record.update(
                         variant=label,
                         prompt_version=PROMPT_VERSION,
@@ -296,7 +338,11 @@ def main() -> int:
                         ts=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                     )
 
+                    # Round trip only: request out, response back, including any retry waits.
+                    # Excludes reading the sample, writing results and the inter-call delay.
+                    query_started = time.monotonic()
                     response = post_json(build_payload(doc, shape, extra_fields), api_key)
+                    record["elapsed_s"] = round(time.monotonic() - query_started, 3)
                     calls += 1
                     logger.debug("Raw response: %s", json.dumps(response))
                     usage = response.get("usage") or {}
@@ -320,13 +366,18 @@ def main() -> int:
 
                     if "error" not in record:
                         logger.info(
-                            "%s [%s] question=%.3f statement=%.3f (repo said %s)",
+                            "%s [%s] question=%.3f statement=%.3f in %.2fs (repo said %s)",
                             doc["PMID"], label, record["q_question"], record["q_statement"],
-                            record["repo_support"],
+                            record["elapsed_s"], record["repo_support"],
                         )
                     time.sleep(args.delay)
     except KeyboardInterrupt:
         logger.warning("Interrupted -- everything completed so far is saved")
+
+    csv_path = Path(args.csv) if args.csv else output_path.with_suffix(".csv")
+    if not csv_path.is_absolute():
+        csv_path = project_root / csv_path
+    csv_rows = write_csv(output_path, csv_path) if output_path.exists() else 0
 
     logger.info("=" * 70)
     logger.info("SUMMARY")
@@ -335,6 +386,7 @@ def main() -> int:
     logger.info("  output tokens: %d", output_tokens)
     logger.info("  elapsed:       %.1fs", time.time() - started)
     logger.info("  results:       %s", output_path)
+    logger.info("  csv view:      %s (%d rows)", csv_path, csv_rows)
     logger.info("=" * 70)
     return 0
 
