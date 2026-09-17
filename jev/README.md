@@ -8,6 +8,35 @@ This work is unlikely to be merged into the parent repo — it is here because t
 and this repo's own verdicts are here. If you are arriving from the pull request and want to
 reuse any of it, [Findings](#findings) is the part worth taking.
 
+## Start here: `typesafe_jev_v3.csv`
+
+**[`typesafe_jev_v3.csv`](typesafe_jev_v3.csv) is the file to look at** — 100 rows, one per
+triple, from prompt version 3 (the configuration we settled on: one statement-phrased Noul,
+full state, cheapest of the four at 503 input tokens per call). The other result files hold all
+400 calls across all four configurations, which is only interesting if you care how we got
+here.
+
+| Column | |
+|---|---|
+| `subject_curie`, `subject_name`, `predicate`, `object_curie`, `object_name`, `PMID` | the triple and the publication it was drawn from |
+| `repo_support` | **this repo's** verdict: `yes` / `no` / `maybe`, from its gpt-oss pipeline reading the whole abstract |
+| `jev_support` | **Jev's** verdict: `yes` / `no` / `maybe`, thresholded from `q_statement` at the 0.4–0.6 band |
+| `q_statement` | the raw probability, 0–1, that the sentences support the triple — the actual model output, and what you want if you would rather pick your own threshold |
+| `variant`, `prompt_version` | which configuration produced the row (all `base` / `3` in this file) |
+| `elapsed_s` | round trip for that one query |
+| `error` | non-empty only if the answer could not be parsed (empty throughout here) |
+
+How the two systems line up across the 100:
+
+| repo \ Jev | yes | maybe | no |
+|---|---|---|---|
+| **yes** | 47 | 3 | 4 |
+| **maybe** | 3 | 3 | 1 |
+| **no** | 7 | 7 | 25 |
+
+75 outright agreements, 11 outright conflicts, 14 where one of the two abstains. Neither column
+is ground truth — see [Caveats](#caveats).
+
 ## What Jev is
 
 [Jev](https://docs.typesafe.ai) is TypeSafe's "System One" model. Unlike a chat LLM, it does
@@ -99,8 +128,20 @@ than silently mixing two prompts in one file.
 |---|---|
 | `validate_with_typesafe.py` | the script |
 | `sample_100_triples.json` | 100 triples sampled uniformly over the 1,571,772 distinct triples in `results_with_names.parquet`, one random PMID row each |
-| `typesafe_jev_results.jsonl` | raw results, one line per (document, prompt version) — the full record |
-| `typesafe_jev_results.csv` | readable view: the triple, what this repo decided, what Jev decided, query time |
+| **`typesafe_jev_v3.csv`** | **the results to use** — 100 rows, one per triple, prompt v3 only |
+| `typesafe_jev_results.jsonl` | raw results, all 400 calls, one line per (document, prompt version) — the full record, including per-call token counts |
+| `typesafe_jev_results.csv` | the same 400 calls as CSV, rewritten from the JSONL after every run |
+
+The v3 file is a filter of the 400-row CSV, so it can be regenerated at any time:
+
+```bash
+python3 -c "
+import csv
+src=list(csv.DictReader(open('jev/typesafe_jev_results.csv')))
+rows=[r for r in src if r['prompt_version']=='3']
+w=csv.DictWriter(open('jev/typesafe_jev_v3.csv','w',newline=''),fieldnames=src[0].keys())
+w.writeheader(); w.writerows(rows)"
+```
 
 The sample was drawn with:
 
@@ -206,9 +247,19 @@ rebanding is a rewrite rather than new API calls.
 | Whole 100-document run | ~52k tokens, ~90s sequential at `--delay 0.5` |
 | All four configurations | ~230k tokens, well under $1 |
 
-Sequential calls with a 0.5s delay never hit a rate limit; we never saw a 429. Note the
-TypeSafe dashboard lagged roughly one run behind the `usage` figures the API itself returned —
-trust the per-response `usage`.
+Sequential calls with a 0.5s delay never hit a rate limit; we never saw a 429.
+
+The per-response `usage` figures reconcile exactly with the TypeSafe console: at four separate
+readings, the console equalled our cumulative input+output plus one 597-token call made before
+this work started, with zero drift. So the console is accurate in real time — useful if you
+want to watch a long run — and **its counter includes output tokens**, though whether output is
+actually priced is invisible at cent granularity. Output was 5.1% of our tokens regardless.
+
+Extrapolating to the 10,000-triple sample: input tokens fit **457 fixed + 0.258 per sentence
+character**, and that sample's sentences are the same size as this one's (mean 184 chars vs
+176), giving ~504 input + 21 output per document, **~5.25M tokens** and roughly **$0.15–0.40**.
+The binding cost is wall clock — 2.4h sequential at `--delay 0.5`, 1.0h at `--delay 0` — so
+concurrency or question-batching needs deciding before that run, and neither is tested here.
 
 ## If you want to push this further
 
