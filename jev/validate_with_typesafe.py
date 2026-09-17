@@ -8,11 +8,11 @@ questions -- one phrased as a question, one as a statement -- and records the re
 probabilities alongside this repo's own verdict, which is held out of the request.
 
 Usage:
-    python scripts/validate_with_typesafe.py --self-check
-    python scripts/validate_with_typesafe.py --dry-run --limit 1
-    python scripts/validate_with_typesafe.py --limit 1
-    python scripts/validate_with_typesafe.py --limit 10
-    python scripts/validate_with_typesafe.py
+    python jev/validate_with_typesafe.py --self-check
+    python jev/validate_with_typesafe.py --dry-run --limit 1
+    python jev/validate_with_typesafe.py --limit 1
+    python jev/validate_with_typesafe.py --limit 10
+    python jev/validate_with_typesafe.py
 
 Requires TYPESAFE_API_KEY in the environment or in .env.
 """
@@ -257,7 +257,7 @@ def load_done(output_path: Path) -> set:
 
 def self_check() -> int:
     """Offline assertions. The first one is the one that matters."""
-    docs = json.loads((project_root / "data" / "sample_100_triples.json").read_text())
+    docs = json.loads((project_root / "jev" / "sample_100_triples.json").read_text())
     doc = docs[0]
 
     # Check the state's keys, not the serialized payload: the questions legitimately contain
@@ -292,8 +292,8 @@ def self_check() -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    parser.add_argument("--input", default="data/sample_100_triples.json")
-    parser.add_argument("--output", default="data/typesafe_jev_results.jsonl")
+    parser.add_argument("--input", default="jev/sample_100_triples.json")
+    parser.add_argument("--output", default="jev/typesafe_jev_results.jsonl")
     parser.add_argument("--csv", help="CSV view of the results (default: --output with .csv)")
     parser.add_argument("--limit", type=int, help="Only process the first N documents")
     parser.add_argument("--extra-fields", default="", help="Comma-separated extra state fields")
