@@ -27,3 +27,6 @@ src/__pycache__/
 
 # skip the downloaded release results
 /results/*
+
+# skip local environment files
+.env
