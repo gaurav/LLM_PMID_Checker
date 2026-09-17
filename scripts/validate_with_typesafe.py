@@ -43,7 +43,11 @@ RETRYABLE_STATUS = {429, 500, 502, 503, 504, 529}
 #   v2: one state shape (identifiers kept -- they disambiguate bare gene symbols), the
 #       statement phrasing only (the two phrasings agreed to within 0.020 over 93 documents),
 #       and criteria tightened against reading co-occurrence as support.
-PROMPT_VERSION = 2
+#   v3: v2 with the original criteria restored. The tightened wording shifted every
+#       probability down ~0.047 without improving discrimination (AUC 0.908 -> 0.899, best
+#       achievable accuracy 87.1% either way), so it was paying tokens to move the scale.
+#       v3 vs v2 isolates the criteria; v3 vs v1 isolates dropping the second question.
+PROMPT_VERSION = 3
 
 # Probabilities in this band are reported as "maybe" rather than yes/no. Judgment call, not a
 # fitted value: jev's probability does NOT reconstruct this repo's own maybe class (those 7
@@ -72,16 +76,9 @@ STATE_FIELDS = (
     "SemMedDB_sentences",
 )
 
-# The "false" criterion names the co-occurrence failure explicitly: over 93 documents the
-# errors ran 9 false positives to 4 false negatives, every one of them a sentence that
-# mentioned both entities without asserting anything between them.
 CRITERIA = {
     "true": "The sentences state, or directly imply, the asserted relationship between the subject and object",
-    "false": (
-        "The sentences do not state the relationship, or state the opposite. Mentioning both "
-        "the subject and the object is not enough: the sentences must assert the relationship "
-        "between them, not merely discuss them together or describe a different relationship"
-    ),
+    "false": "The sentences do not state the relationship, or state the opposite",
 }
 
 QUESTIONS = {
